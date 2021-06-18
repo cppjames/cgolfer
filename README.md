@@ -17,6 +17,6 @@ C's syntax is very complex and it is very difficult to engineer backwards a prog
 
 - `-s <source>` - Provide a starting point for the generated source (as opposed to starting from no characters and gradually adding more in the order that is specified in `cgolfer.c`)
 
-- `-t <input> <output>` - Adds a new test case with input `<input>` and output `<output>`. Any number of test cases can be added, and they all must be passed for the program to be considered correct. Example: `cgolfer -t a b -t "12 3" "23 4"` (find the shortest program that when given the string `a` produces the output `b` and when given `12 3` outputs `23 4`). Note that without any tests C Golfer will see any program that compiles as correct, so the resulting program will always be `main;`, unless the maximum number of characters is set to be less than 5.
+- `-t <input> <output>` - Adds a new test case with input `<input>` and output `<output>`. Any number of test cases can be added, and they all must be passed for the program to be considered correct. Example: `cgolfer -t a b -t "12 3" "23 4"` (find the shortest program that when given the string `a` produces the output `b` and when given `12 3` outputs `23 4`). Note that without any tests C Golfer will see any program that compiles as correct, so the resulting program will always be `main;`, unless the maximum number of characters is set to be less than 5, or a starting point is provided.
 
 - `-v` - Verbose mode (print all sources as they are being compiled and tested).
