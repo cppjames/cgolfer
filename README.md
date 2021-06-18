@@ -5,8 +5,6 @@ Here is an example:
 ```bash
 $ cgolfer -t "" "x"
 main(){puts("x");}
-
-$
 ```
 
 The `-t` option adds a new test case and is followed by the input and the output. In this case, the program takes no input and it should output the letter `x`. The shortest possible C program that fulfills the requirement is `main(){puts("x");}`.
