@@ -1,12 +1,21 @@
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdbool.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+
+#define fail(...) \
+    do { fprintf(stderr, __VA_ARGS__); terminate(EXIT_FAILURE); } while (0)
 
 #define check_ptr(ptr, ...) \
-    do { if (!ptr) { fprintf(stderr, __VA_ARGS__); exit(EXIT_FAILURE); } } while (0)
+    do { if (!ptr) fail(__VA_ARGS__); } while (0)
 
+void init_control_mechanism();
+void shutdown_control_mechanism();
 void parse_cmdline_args(int count, char** args);
 void add_test(const char* input, const char* output);
 void test_all_of_length(size_t length);
@@ -17,6 +26,12 @@ bool run_test(size_t test);
 bool are_files_equal(FILE* file1, FILE* file2);
 void get_next_source(size_t* source, size_t length);
 bool is_last_source(size_t* source, size_t length);
+void terminate(int result);
+
+int shared_cond_fd = -1;
+pthread_cond_t* shared_cond = NULL;
+bool shared_cond_owner = false;
+bool shared_cond_owner_set = false;
 
 const char char_set[] = {
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -34,11 +49,85 @@ bool verbose_mode = false;
 
 int main(int argc, char** argv) {
     parse_cmdline_args(argc, argv);
+    init_control_mechanism();
 
     for (size_t code_len = start_length; code_len <= max_code_length; code_len++)
         test_all_of_length(code_len);
 
-    exit(EXIT_SUCCESS);
+    terminate(EXIT_SUCCESS);
+}
+
+void init_control_mechanism() {
+    shared_cond_fd = shm_open("/shared_cond0", O_RDWR, 0600);
+
+    if (shared_cond_fd >= 0) {
+        if (!shared_cond_owner_set) {
+            shared_cond_owner = false;
+            shared_cond_owner_set = true;
+        }
+        printf("The shared memory /shared_cond0 is opened.\n");
+    } else if (errno == ENOENT) {
+        printf("WARN: The shared memory /shared_cond0 does not exist.\n");
+        shared_cond_fd = shm_open("/shared_cond0", O_CREAT | O_RDWR, 0600);
+
+        if (shared_cond_fd >= 0) {
+            if (!shared_cond_owner_set) {
+                shared_cond_owner = true;
+                shared_cond_owner_set = true;
+            }
+
+            printf("The shared memory /shared_cond0 is created and opened.\n");
+
+            if (ftruncate(shared_cond_fd, sizeof(pthread_cond_t)) < 0)
+                fail("Truncation of condition variable failed: %s\n", strerror(errno));
+        } else
+            fail("Failed to create shared memory: %s\n", strerror(errno));
+    } else
+        fail("Failed to create shared memory: %s\n", strerror(errno));
+
+    void* map = mmap(0, sizeof(pthread_cond_t),
+        PROT_READ | PROT_WRITE, MAP_SHARED, shared_cond_fd, 0);
+
+    if (map == MAP_FAILED)
+        fail("Mapping failed: %s\n", strerror(errno));
+
+    shared_cond = (pthread_cond_t*)map;
+
+    if (shared_cond_owner) {
+        pthread_condattr_t cond_attr;
+
+        int ret = -1;
+        if (ret = pthread_condattr_init(&cond_attr))
+            fail("Initializing cv attrs failed: %s\n", strerror(ret));
+        printf("Condition attributes initialized.\n");
+
+        if (ret = pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED))
+            fail("Setting as process shared failed: %s\n", strerror(ret));
+
+        if (ret = pthread_cond_init(shared_cond, &cond_attr))
+            fail("Initializing the cv failed: %d %s\n", ret, strerror(ret));
+
+        if (ret = pthread_condattr_destroy(&cond_attr))
+            fail("Destruction of cond attrs failed: %s\n", strerror(ret));
+    }
+}
+
+void shutdown_control_mechanism() {
+    int ret = -1;
+    //if (ret = pthread_cond_destroy(shared_cond))
+    //    fail("Failed to destroy condition variable: %s\n", strerror(ret));
+
+    if (munmap(shared_cond, sizeof(pthread_cond_t)) < 0)
+        fail("Unmapping the condition variable failed: %s\n", strerror(errno));
+    
+    if (close(shared_cond_fd) < 0)
+        fail("Closing the condition variable failed: %s\n", strerror(errno));
+
+    //if (shared_cond_owner) {
+        if (shm_unlink("/shared_cond0") < 0)
+            fail("Unlinking the condition variable failed: %s\n", strerror(errno));
+        printf("Unlinked the condition variable.\n");
+    //}
 }
 
 void parse_cmdline_args(int count, char** args) {
@@ -48,8 +137,6 @@ void parse_cmdline_args(int count, char** args) {
     bool expecting_start = false;
 
     const char* test_input = NULL;
-
-#define arg_fail(...) do { fprintf(stderr, __VA_ARGS__); exit(EXIT_FAILURE); } while (0)
 
     for (int arg_index = 1; arg_index < count; arg_index++) {
         const char* arg = args[arg_index];
@@ -69,7 +156,7 @@ void parse_cmdline_args(int count, char** args) {
             start_source = arg;
             expecting_start = false;
         } else if (arg[0] != '-') {
-            arg_fail("Invalid argument: %s\n", arg);
+            fail("Invalid argument: %s\n", arg);
         } else if (arg[1] == 'n') {
             expecting_max_length = true;
         } else if (arg[1] == 't') {
@@ -79,15 +166,13 @@ void parse_cmdline_args(int count, char** args) {
         } else if (arg[1] == 'v') {
             verbose_mode = true;
         } else
-            arg_fail("Invalid argument: %s\n", arg);
+            fail("Invalid argument: %s\n", arg);
     }
 
-    if (expecting_max_length) arg_fail("Length for code length parameter not specified.\n");
-    if (expecting_input) arg_fail("Input and output for last test not specified.\n");
-    if (expecting_output) arg_fail("Output for last test not specified.\n");
-    if (expecting_start) arg_fail("Starting point parameter not specified.\n");
-
-#undef arg_fail
+    if (expecting_max_length) fail("Length for code length parameter not specified.\n");
+    if (expecting_input) fail("Input and output for last test not specified.\n");
+    if (expecting_output) fail("Output for last test not specified.\n");
+    if (expecting_start) fail("Starting point parameter not specified.\n");
 }
 
 void add_test(const char* input, const char* output) {
@@ -172,7 +257,7 @@ void test_source(char* source) {
 
         if (successful_tests == test_count) {
             printf("%s\n", source);
-            exit(EXIT_SUCCESS);
+            terminate(EXIT_SUCCESS);
         } else if (verbose_mode)
             printf("[  Not Passing  ] %s\n", source);
     } else if (verbose_mode)
@@ -250,4 +335,9 @@ bool is_last_source(size_t* source, size_t length) {
             return false;
 
     return true;
+}
+
+void terminate(int result) {
+    shutdown_control_mechanism();
+    exit(result);
 }
