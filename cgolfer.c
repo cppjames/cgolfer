@@ -86,6 +86,8 @@ void parse_cmdline_args(int count, char** args) {
     if (expecting_input) arg_fail("Input and output for last test not specified.\n");
     if (expecting_output) arg_fail("Output for last test not specified.\n");
     if (expecting_start) arg_fail("Starting point parameter not specified.\n");
+
+#undef arg_fail
 }
 
 void add_test(const char* input, const char* output) {
