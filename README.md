@@ -1,5 +1,5 @@
 # C Golfer
-**C Golfer** is a program that takes in sets of inputs and outputs and finds the shortest possible C source the produces the outputs on `stdout` when the inputs are passed to it in `stdin`.
+**C Golfer** is a program that takes in sets of inputs and outputs and finds the shortest possible C source that produces the outputs on `stdout` when the inputs are passed to it in `stdin`.
 
 Here is an example:
 ```bash
