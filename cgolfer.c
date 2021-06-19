@@ -50,6 +50,7 @@ size_t test_count = 0;
 size_t start_length = 0;
 const char* start_source = "";
 bool verbose_mode = false;
+time_t max_time = 3;
 
 int main(int argc, char** argv) {
     parse_cmdline_args(argc, argv);
@@ -80,6 +81,7 @@ void parse_cmdline_args(int count, char** args) {
     bool expecting_input = false;
     bool expecting_output = false;
     bool expecting_start = false;
+    bool expecting_time = false;
 
     const char* test_input = NULL;
 
@@ -100,6 +102,9 @@ void parse_cmdline_args(int count, char** args) {
             start_length = strlen(arg);
             start_source = arg;
             expecting_start = false;
+        } else if (expecting_time) {
+            max_time = atoi(arg);
+            expecting_time = false;
         } else if (arg[0] != '-') {
             fail("Invalid argument: %s\n", arg);
         } else if (arg[1] == 'n') {
@@ -110,6 +115,8 @@ void parse_cmdline_args(int count, char** args) {
             expecting_start = true;
         } else if (arg[1] == 'v') {
             verbose_mode = true;
+        } else if (arg[1] == 'w') {
+            expecting_time = true;
         } else
             fail("Invalid argument: %s\n", arg);
     }
@@ -263,7 +270,7 @@ bool run_test(size_t test) {
     if (!finished_flag) {
         struct timespec time;
         clock_gettime(CLOCK_REALTIME, &time);
-        time.tv_sec += 2;
+        time.tv_sec += max_time;
         pthread_cond_timedwait(&finished_cv, &finished_flag_mtx, &time);
     }
 
