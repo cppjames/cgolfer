@@ -1,12 +1,22 @@
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <stdbool.h>
 #include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <time.h>
+#include <sys/wait.h>
+
+#define fail(...) \
+    do { fprintf(stderr, __VA_ARGS__); terminate(EXIT_FAILURE); } while (0)
 
 #define check_ptr(ptr, ...) \
-    do { if (!ptr) { fprintf(stderr, __VA_ARGS__); exit(EXIT_FAILURE); } } while (0)
+    do { if (!ptr) fail(__VA_ARGS__); } while (0)
 
+void shared_state_init();
+void shared_state_destroy();
 void parse_cmdline_args(int count, char** args);
 void add_test(const char* input, const char* output);
 void test_all_of_length(size_t length);
@@ -17,12 +27,21 @@ bool run_test(size_t test);
 bool are_files_equal(FILE* file1, FILE* file2);
 void get_next_source(size_t* source, size_t length);
 bool is_last_source(size_t* source, size_t length);
+void terminate(int result);
+
+bool exec_fail_flag = false;
+bool finished_flag = false;
+pid_t child_pid = 0;
+pthread_mutex_t exec_fail_flag_mtx;
+pthread_mutex_t finished_flag_mtx;
+pthread_barrier_t child_pid_barrier;
+pthread_cond_t finished_cv;
 
 const char char_set[] = {
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "abcdefghijklmnopqrstuvwxyz"
     "0123456789"
-    " !\"#%&'()*+,-./:;<=>?[\\]^-{|}~"
+    " !\"_#%&'()*+,-./:;<=>?[\\]^-{|}~"
 };
 
 const size_t char_set_length = sizeof char_set - 1;
@@ -34,11 +53,26 @@ bool verbose_mode = false;
 
 int main(int argc, char** argv) {
     parse_cmdline_args(argc, argv);
+    shared_state_init();
 
     for (size_t code_len = start_length; code_len <= max_code_length; code_len++)
         test_all_of_length(code_len);
 
-    exit(EXIT_SUCCESS);
+    terminate(EXIT_SUCCESS);
+}
+
+void shared_state_init() {
+    pthread_mutex_init(&exec_fail_flag_mtx, NULL);
+    pthread_mutex_init(&finished_flag_mtx, NULL);
+    pthread_barrier_init(&child_pid_barrier, NULL, 2);
+    pthread_cond_init(&finished_cv, NULL);
+}
+
+void shared_state_destroy() {
+    pthread_mutex_destroy(&exec_fail_flag_mtx);
+    pthread_mutex_destroy(&finished_flag_mtx);
+    pthread_barrier_destroy(&child_pid_barrier);
+    pthread_cond_destroy(&finished_cv);
 }
 
 void parse_cmdline_args(int count, char** args) {
@@ -48,8 +82,6 @@ void parse_cmdline_args(int count, char** args) {
     bool expecting_start = false;
 
     const char* test_input = NULL;
-
-#define arg_fail(...) do { fprintf(stderr, __VA_ARGS__); exit(EXIT_FAILURE); } while (0)
 
     for (int arg_index = 1; arg_index < count; arg_index++) {
         const char* arg = args[arg_index];
@@ -69,7 +101,7 @@ void parse_cmdline_args(int count, char** args) {
             start_source = arg;
             expecting_start = false;
         } else if (arg[0] != '-') {
-            arg_fail("Invalid argument: %s\n", arg);
+            fail("Invalid argument: %s\n", arg);
         } else if (arg[1] == 'n') {
             expecting_max_length = true;
         } else if (arg[1] == 't') {
@@ -79,15 +111,13 @@ void parse_cmdline_args(int count, char** args) {
         } else if (arg[1] == 'v') {
             verbose_mode = true;
         } else
-            arg_fail("Invalid argument: %s\n", arg);
+            fail("Invalid argument: %s\n", arg);
     }
 
-    if (expecting_max_length) arg_fail("Length for code length parameter not specified.\n");
-    if (expecting_input) arg_fail("Input and output for last test not specified.\n");
-    if (expecting_output) arg_fail("Output for last test not specified.\n");
-    if (expecting_start) arg_fail("Starting point parameter not specified.\n");
-
-#undef arg_fail
+    if (expecting_max_length) fail("Length for code length parameter not specified.\n");
+    if (expecting_input) fail("Input and output for last test not specified.\n");
+    if (expecting_output) fail("Output for last test not specified.\n");
+    if (expecting_start) fail("Starting point parameter not specified.\n");
 }
 
 void add_test(const char* input, const char* output) {
@@ -172,11 +202,47 @@ void test_source(char* source) {
 
         if (successful_tests == test_count) {
             printf("%s\n", source);
-            exit(EXIT_SUCCESS);
+            terminate(EXIT_SUCCESS);
         } else if (verbose_mode)
             printf("[  Not Passing  ] %s\n", source);
     } else if (verbose_mode)
         printf("[ Compile Error ] %s\n", source);
+}
+
+bool fork_and_exec(char* command) {
+    pid_t pid = fork();
+
+    if (pid) {
+        child_pid = pid;
+        pthread_barrier_wait(&child_pid_barrier);
+
+        int exit_code;
+        waitpid(pid, &exit_code, 0);
+        return exit_code;
+    } else {
+        FILE* test_process = popen(command, "r");
+
+        if (!test_process)
+            exit(false);
+        
+        pclose(test_process);
+        exit(true);
+    }
+}
+
+void* exec_program(void* command) {
+    if (!fork_and_exec(command)) {
+        pthread_mutex_lock(&exec_fail_flag_mtx);
+        exec_fail_flag = true;
+        pthread_mutex_unlock(&exec_fail_flag_mtx);
+    }
+
+    pthread_mutex_lock(&finished_flag_mtx);
+    finished_flag = true;
+    pthread_cond_signal(&finished_cv);
+    pthread_mutex_unlock(&finished_flag_mtx);
+
+    return NULL;
 }
 
 bool run_test(size_t test) {
@@ -185,9 +251,32 @@ bool run_test(size_t test) {
     char* command = calloc(command_size, 1);
     sprintf(command, command_format, test);
 
-    FILE* test_process = popen(command, "r");
-    check_ptr(test_process, "Could not run the compiled program.\n");
-    pclose(test_process);
+    pthread_t exec_thread;
+    int thread_create_result = pthread_create(&exec_thread, NULL, exec_program, command);
+
+    if (thread_create_result)
+        fail("Could not create the execution thread.\n");
+
+    pthread_barrier_wait(&child_pid_barrier);
+
+    pthread_mutex_lock(&finished_flag_mtx);
+    if (!finished_flag) {
+        struct timespec time;
+        clock_gettime(CLOCK_REALTIME, &time);
+        time.tv_sec += 2;
+        pthread_cond_timedwait(&finished_cv, &finished_flag_mtx, &time);
+    }
+
+    pthread_mutex_lock(&exec_fail_flag_mtx);
+    if (exec_fail_flag)
+        fail("Could not run compiled program.\n");
+    pthread_mutex_unlock(&exec_fail_flag_mtx);
+
+    if (!finished_flag)
+        kill(child_pid, SIGKILL);
+    pthread_mutex_unlock(&finished_flag_mtx);
+
+    pthread_join(exec_thread, NULL);
 
     int index_len = snprintf(NULL, 0, "%zu", test);
     char* test_output_filename = calloc(index_len + 14, 1);
@@ -250,4 +339,9 @@ bool is_last_source(size_t* source, size_t length) {
             return false;
 
     return true;
+}
+
+void terminate(int result) {
+    shared_state_destroy();
+    exit(result);
 }
