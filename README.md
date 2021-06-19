@@ -20,3 +20,5 @@ C's syntax is very complex and it is very difficult to engineer backwards a prog
 - `-t <input> <output>` - Adds a new test case with input `<input>` and output `<output>`. Any number of test cases can be added, and they all must be passed for the program to be considered correct. Example: `cgolfer -t a b -t "12 3" "23 4"` (find the shortest program that when given the string `a` produces the output `b` and when given `12 3` outputs `23 4`). Note that without any tests C Golfer will see any program that compiles as correct, so the resulting program will always be `main;`, unless the maximum number of characters is set to be less than 5, or a starting point is provided.
 
 - `-v` - Verbose mode (print all sources as they are being compiled and tested).
+
+- `-w <seconds>` - Set the maximum waiting time. If the generated program takes more than this number of seconds to execute, it is considered that the program does not pass the test and is discarded. Default is 3 seconds. 
