@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 #define fail(...) \
     do { fprintf(stderr, __VA_ARGS__); terminate(EXIT_FAILURE); } while (0)
@@ -15,8 +16,13 @@
 #define check_ptr(ptr, ...) \
     do { if (!ptr) fail(__VA_ARGS__); } while (0)
 
+#define critical(mtx) \
+    for (pthread_mutex_lock(mtx);; pthread_mutex_unlock(mtx))
+
 void shared_state_init();
 void shared_state_destroy();
+void finished_signal_handler(int signal);
+void exec_fail_signal_handler(int signal);
 void parse_cmdline_args(int count, char** args);
 void add_test(const char* input, const char* output);
 void test_all_of_length(size_t length);
@@ -63,6 +69,8 @@ int main(int argc, char** argv) {
 }
 
 void shared_state_init() {
+    signal(SIGUSR1, finished_signal_handler);
+    signal(SIGUSR2, exec_fail_signal_handler);
     pthread_mutex_init(&exec_fail_flag_mtx, NULL);
     pthread_mutex_init(&finished_flag_mtx, NULL);
     pthread_barrier_init(&child_pid_barrier, NULL, 2);
@@ -74,6 +82,18 @@ void shared_state_destroy() {
     pthread_mutex_destroy(&finished_flag_mtx);
     pthread_barrier_destroy(&child_pid_barrier);
     pthread_cond_destroy(&finished_cv);
+}
+
+void finished_signal_handler(int signal) {
+    //pthread_mutex_lock(&finished_flag_mtx);
+    finished_flag = true;
+    //pthread_mutex_unlock(&finished_flag_mtx);
+}
+
+void exec_fail_signal_handler(int signal) {
+    //pthread_mutex_lock(&exec_fail_flag_mtx);
+    exec_fail_flag = true;
+    //pthread_mutex_unlock(&exec_fail_flag_mtx);
 }
 
 void parse_cmdline_args(int count, char** args) {
@@ -229,23 +249,22 @@ bool fork_and_exec(char* command) {
     } else {
         FILE* test_process = popen(command, "r");
 
+        pid_t parent_pid = getppid();
+        kill(parent_pid, SIGUSR1);
+
         if (!test_process)
-            exit(false);
-        
-        pclose(test_process);
+            kill(parent_pid, SIGUSR2);
+        else
+            pclose(test_process);
+
         exit(true);
     }
 }
 
 void* exec_program(void* command) {
-    if (!fork_and_exec(command)) {
-        pthread_mutex_lock(&exec_fail_flag_mtx);
-        exec_fail_flag = true;
-        pthread_mutex_unlock(&exec_fail_flag_mtx);
-    }
+    fork_and_exec(command);
 
     pthread_mutex_lock(&finished_flag_mtx);
-    finished_flag = true;
     pthread_cond_signal(&finished_cv);
     pthread_mutex_unlock(&finished_flag_mtx);
 
@@ -274,10 +293,10 @@ bool run_test(size_t test) {
         pthread_cond_timedwait(&finished_cv, &finished_flag_mtx, &time);
     }
 
-    pthread_mutex_lock(&exec_fail_flag_mtx);
+    //pthread_mutex_lock(&exec_fail_flag_mtx);
     if (exec_fail_flag)
         fail("Could not run compiled program.\n");
-    pthread_mutex_unlock(&exec_fail_flag_mtx);
+    //pthread_mutex_unlock(&exec_fail_flag_mtx);
 
     if (!finished_flag)
         kill(child_pid, SIGKILL);
