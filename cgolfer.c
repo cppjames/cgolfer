@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <time.h>
 #include <sys/wait.h>
+#include <signal.h>
 
 #define fail(...) \
     do { fprintf(stderr, __VA_ARGS__); terminate(EXIT_FAILURE); } while (0)
@@ -21,6 +22,7 @@
 
 void shared_state_init();
 void shared_state_destroy();
+void finished_signal_handler(int signal);
 void parse_cmdline_args(int count, char** args);
 void add_test(const char* input, const char* output);
 void test_all_of_length(size_t length);
@@ -34,10 +36,10 @@ bool is_last_source(size_t* source, size_t length);
 void terminate(int result);
 
 bool exec_fail_flag = false;
-bool finished_flag = false;
+sig_atomic_t finished_flag = false;
 pid_t child_pid = 0;
 pthread_mutex_t exec_fail_flag_mtx;
-pthread_mutex_t finished_flag_mtx;
+pthread_mutex_t finished_cv_mtx;
 pthread_barrier_t child_pid_barrier;
 pthread_cond_t finished_cv;
 
@@ -67,17 +69,22 @@ int main(int argc, char** argv) {
 }
 
 void shared_state_init() {
+    signal(SIGUSR1, finished_signal_handler);
     pthread_mutex_init(&exec_fail_flag_mtx, NULL);
-    pthread_mutex_init(&finished_flag_mtx, NULL);
+    pthread_mutex_init(&finished_cv_mtx, NULL);
     pthread_barrier_init(&child_pid_barrier, NULL, 2);
     pthread_cond_init(&finished_cv, NULL);
 }
 
 void shared_state_destroy() {
     pthread_mutex_destroy(&exec_fail_flag_mtx);
-    pthread_mutex_destroy(&finished_flag_mtx);
+    pthread_mutex_destroy(&finished_cv_mtx);
     pthread_barrier_destroy(&child_pid_barrier);
     pthread_cond_destroy(&finished_cv);
+}
+
+void finished_signal_handler(int signal) {
+    finished_flag = true;
 }
 
 void parse_cmdline_args(int count, char** args) {
@@ -233,11 +240,15 @@ bool fork_and_exec(char* command) {
     } else {
         FILE* test_process = popen(command, "r");
 
-        if (!test_process)
-            exit(false);
+        bool ret_value = true;
+
+        if (!test_process) 
+            ret_value = false;
         
         pclose(test_process);
-        exit(true);
+        kill(getppid(), SIGUSR1);
+        
+        exit(ret_value);
     }
 }
 
@@ -245,10 +256,8 @@ void* exec_program(void* command) {
     if (!fork_and_exec(command))
         critical (&exec_fail_flag_mtx) exec_fail_flag = true;
 
-    critical (&finished_flag_mtx) {
-        finished_flag = true;
+    critical (&finished_cv_mtx)
         pthread_cond_signal(&finished_cv);
-    }
 
     return NULL;
 }
@@ -267,22 +276,21 @@ bool run_test(size_t test) {
 
     pthread_barrier_wait(&child_pid_barrier);
 
-    critical (&finished_flag_mtx) {
-        if (!finished_flag) {
-            struct timespec time;
-            clock_gettime(CLOCK_REALTIME, &time);
-            time.tv_sec += max_time;
-            pthread_cond_timedwait(&finished_cv, &finished_flag_mtx, &time);
-        }
-
-        critical (&exec_fail_flag_mtx) {
-            if (exec_fail_flag)
-                fail("Could not run compiled program.\n");
-        }
-
-        if (!finished_flag)
-            kill(child_pid, SIGKILL);
+    if (!finished_flag) {
+        struct timespec time;
+        clock_gettime(CLOCK_REALTIME, &time);
+        time.tv_sec += max_time;
+        critical (&finished_cv_mtx)
+            pthread_cond_timedwait(&finished_cv, &finished_cv_mtx, &time);
     }
+
+    critical (&exec_fail_flag_mtx) {
+        if (exec_fail_flag)
+            fail("Could not run compiled program.\n");
+    }
+
+    if (!finished_flag)
+        kill(child_pid, SIGKILL);
 
     pthread_join(exec_thread, NULL);
 
