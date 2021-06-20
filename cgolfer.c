@@ -15,6 +15,10 @@
 #define check_ptr(ptr, ...) \
     do { if (!ptr) fail(__VA_ARGS__); } while (0)
 
+#define critical(mtx) \
+    for (bool critical_exec_once = false; !critical_exec_once;) \
+        for (pthread_mutex_lock(mtx); !critical_exec_once; pthread_mutex_unlock(mtx), critical_exec_once = true)
+
 void shared_state_init();
 void shared_state_destroy();
 void parse_cmdline_args(int count, char** args);
@@ -238,16 +242,13 @@ bool fork_and_exec(char* command) {
 }
 
 void* exec_program(void* command) {
-    if (!fork_and_exec(command)) {
-        pthread_mutex_lock(&exec_fail_flag_mtx);
-        exec_fail_flag = true;
-        pthread_mutex_unlock(&exec_fail_flag_mtx);
-    }
+    if (!fork_and_exec(command))
+        critical (&exec_fail_flag_mtx) exec_fail_flag = true;
 
-    pthread_mutex_lock(&finished_flag_mtx);
-    finished_flag = true;
-    pthread_cond_signal(&finished_cv);
-    pthread_mutex_unlock(&finished_flag_mtx);
+    critical (&finished_flag_mtx) {
+        finished_flag = true;
+        pthread_cond_signal(&finished_cv);
+    }
 
     return NULL;
 }
@@ -266,22 +267,22 @@ bool run_test(size_t test) {
 
     pthread_barrier_wait(&child_pid_barrier);
 
-    pthread_mutex_lock(&finished_flag_mtx);
-    if (!finished_flag) {
-        struct timespec time;
-        clock_gettime(CLOCK_REALTIME, &time);
-        time.tv_sec += max_time;
-        pthread_cond_timedwait(&finished_cv, &finished_flag_mtx, &time);
+    critical (&finished_flag_mtx) {
+        if (!finished_flag) {
+            struct timespec time;
+            clock_gettime(CLOCK_REALTIME, &time);
+            time.tv_sec += max_time;
+            pthread_cond_timedwait(&finished_cv, &finished_flag_mtx, &time);
+        }
+
+        critical (&exec_fail_flag_mtx) {
+            if (exec_fail_flag)
+                fail("Could not run compiled program.\n");
+        }
+
+        if (!finished_flag)
+            kill(child_pid, SIGKILL);
     }
-
-    pthread_mutex_lock(&exec_fail_flag_mtx);
-    if (exec_fail_flag)
-        fail("Could not run compiled program.\n");
-    pthread_mutex_unlock(&exec_fail_flag_mtx);
-
-    if (!finished_flag)
-        kill(child_pid, SIGKILL);
-    pthread_mutex_unlock(&finished_flag_mtx);
 
     pthread_join(exec_thread, NULL);
 
