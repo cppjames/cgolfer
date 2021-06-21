@@ -16,10 +16,6 @@
 #define check_ptr(ptr, ...) \
     do { if (!ptr) fail(__VA_ARGS__); } while (0)
 
-#define critical(mtx) \
-    for (bool critical_exec_once = false; !critical_exec_once;) \
-        for (pthread_mutex_lock(mtx); !critical_exec_once; pthread_mutex_unlock(mtx), critical_exec_once = true)
-
 void shared_state_init();
 void shared_state_destroy();
 void finished_signal_handler(int signal);
@@ -35,14 +31,6 @@ void get_next_source(size_t* source, size_t length);
 bool is_last_source(size_t* source, size_t length);
 void terminate(int result);
 
-bool exec_fail_flag = false;
-sig_atomic_t finished_flag = false;
-pid_t child_pid = 0;
-pthread_mutex_t exec_fail_flag_mtx;
-pthread_mutex_t finished_cv_mtx;
-pthread_barrier_t child_pid_barrier;
-pthread_cond_t finished_cv;
-
 const char char_set[] = {
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "abcdefghijklmnopqrstuvwxyz"
@@ -51,6 +39,15 @@ const char char_set[] = {
 };
 
 const size_t char_set_length = sizeof char_set - 1;
+
+bool exec_fail_flag = false;
+sig_atomic_t finished_flag = false;
+pid_t child_pid = 0;
+pthread_mutex_t exec_fail_flag_mtx;
+pthread_mutex_t finished_cv_mtx;
+pthread_barrier_t child_pid_barrier;
+pthread_cond_t finished_cv;
+
 size_t max_code_length = 1000;
 size_t test_count = 0;
 size_t start_length = 0;
@@ -139,27 +136,30 @@ void parse_cmdline_args(int count, char** args) {
 }
 
 void add_test(const char* input, const char* output) {
+    // Find number of characters needed by index
     int index_len = snprintf(NULL, 0, "%zu", test_count);
     
-    // /tmp/test<>_in
+    // Get test input filename in format "/tmp/test<index>_in"
     char* input_filename = calloc(index_len + 13, 1);
     sprintf(input_filename, "/tmp/test%zu_in", test_count);
+
+    // Write input data to file
     FILE* input_file = fopen(input_filename, "wb+");
-
     check_ptr(input_file, "Could not input open file for test case %zu.\n", test_count);
-
     fwrite(input, 1, strlen(input), input_file);
+
     fclose(input_file);
     free(input_filename);
 
-    // /tmp/test<>_out
+    // Get test output filename in format "/tmp/test<index>_out"
     char* output_filename = calloc(index_len + 14, 1);
     sprintf(output_filename, "/tmp/test%zu_out", test_count);
+
+    // Write output data to file
     FILE* output_file = fopen(output_filename, "wb+");
-
     check_ptr(output_file, "Could not output open file for test case %zu.\n", test_count);
-
     fwrite(output, 1, strlen(output), output_file);
+
     fclose(output_file);
     free(output_filename);
 
@@ -170,6 +170,7 @@ void test_all_of_length(size_t length) {
     size_t* source_indices = calloc(length, sizeof(size_t));
     char* source_text = calloc(length + 1, 1);
 
+    // We are on our first iteration, use initial source provided by user
     if (length == start_length)
         source_text_to_indices(start_source, source_indices, length);
 
@@ -183,12 +184,14 @@ void test_all_of_length(size_t length) {
 }
 
 void source_indices_to_text(const size_t* indices, char* text, size_t length) {
+    // Indices are offsets into the character set array
     for (size_t i = 0; i < length; i++)
         text[i] = char_set[indices[i]];
 }
 
 void source_text_to_indices(const char* text, size_t* indices, size_t length) {
     for (size_t i = 0; i < length; i++) {
+        // Find offset in character set
         for (size_t ch = 0; ch < char_set_length; ch++) {
             if (char_set[ch] == text[i]) {
                 indices[i] = ch;
@@ -200,69 +203,82 @@ void source_text_to_indices(const char* text, size_t* indices, size_t length) {
 
 void test_source(char* source) {
     const char* filename = "/tmp/test_source.c";
+
+    // Write source code to file
     FILE* source_file = fopen(filename, "wb+");
-
     check_ptr(source_file, "Could not output open source file.\n");
-
     fwrite(source, 1, strlen(source), source_file);
     fclose(source_file);
 
+    // Compile source file
     FILE* gcc_process = popen("gcc /tmp/test_source.c -o /tmp/test_program.out 2> /dev/null", "r");
-
     check_ptr(gcc_process, "Could not run the compiler.\n");
+    bool compiled = pclose(gcc_process) == 0;
 
-    int exit_code = pclose(gcc_process);
-    if (!exit_code) {
-        size_t successful_tests = 0;
+    if (compiled) {
+        bool passed_all_tests = true;
 
-        for (size_t i = 0; i < test_count; i++)
-            successful_tests += run_test(i);
+        // Run every test on the compiled binary
+        for (size_t i = 0; i < test_count; i++) {
+            if (!run_test(i)) {
+                passed_all_tests = false;
+                break;
+            }
+        }
 
-        if (successful_tests == test_count) {
+        if (passed_all_tests) {
             printf("%s\n", source);
             terminate(EXIT_SUCCESS);
         } else if (verbose_mode)
             printf("[  Not Passing  ] %s\n", source);
+
     } else if (verbose_mode)
         printf("[ Compile Error ] %s\n", source);
 }
 
-bool fork_and_exec(char* command) {
+void* exec_program(void* command) {
     pid_t pid = fork();
 
-    if (pid) {
-        child_pid = pid;
-        pthread_barrier_wait(&child_pid_barrier);
-
-        int exit_code;
-        waitpid(pid, &exit_code, 0);
-        return exit_code;
-    } else {
+    // This is the child process
+    if (pid == 0) {
         FILE* test_process = popen(command, "r");
 
         bool ret_value = true;
-
-        if (!test_process) 
-            ret_value = false;
         
-        pclose(test_process);
+        if (test_process) 
+            pclose(test_process);
+        else
+            ret_value = false;
+
+        // Notify parent process about program finish
         kill(getppid(), SIGUSR1);
         
         exit(ret_value);
     }
-}
 
-void* exec_program(void* command) {
-    if (!fork_and_exec(command))
-        critical (&exec_fail_flag_mtx) exec_fail_flag = true;
+    child_pid = pid;
+    pthread_barrier_wait(&child_pid_barrier);
 
-    critical (&finished_cv_mtx)
-        pthread_cond_signal(&finished_cv);
+    // Wait for child process to finish and get exit code
+    int exit_code;
+    waitpid(pid, &exit_code, 0);
+
+    if (!exit_code) {
+        pthread_mutex_lock(&exec_fail_flag_mtx);
+        exec_fail_flag = true;
+        pthread_mutex_unlock(&exec_fail_flag_mtx);
+    }
+
+    pthread_mutex_lock(&finished_cv_mtx);
+    pthread_cond_signal(&finished_cv);
+    pthread_mutex_unlock(&finished_cv_mtx);
 
     return NULL;
 }
 
 bool run_test(size_t test) {
+    finished_flag = false;
+
     const char* command_format = "/tmp/test_program.out < /tmp/test%zu_in > /tmp/test_program_output";
     int command_size = snprintf(NULL, 0, command_format, test);
     char* command = calloc(command_size, 1);
@@ -280,14 +296,15 @@ bool run_test(size_t test) {
         struct timespec time;
         clock_gettime(CLOCK_REALTIME, &time);
         time.tv_sec += max_time;
-        critical (&finished_cv_mtx)
-            pthread_cond_timedwait(&finished_cv, &finished_cv_mtx, &time);
+        pthread_mutex_lock(&finished_cv_mtx);
+        pthread_cond_timedwait(&finished_cv, &finished_cv_mtx, &time);
+        pthread_mutex_unlock(&finished_cv_mtx);
     }
 
-    critical (&exec_fail_flag_mtx) {
+    pthread_mutex_lock(&exec_fail_flag_mtx);
         if (exec_fail_flag)
             fail("Could not run compiled program.\n");
-    }
+    pthread_mutex_unlock(&exec_fail_flag_mtx);
 
     if (!finished_flag)
         kill(child_pid, SIGKILL);
